@@ -73,4 +73,6 @@ The compiled binary will be at `dist\mouse_tts.exe`.
 | `Pillow`      | Icon image handling           |
 | `pyinstaller` | Build standalone `.exe`       |
 
-# 
+## License
+
+MIT © [Alex Gavr](https://github.com/reverieline) — see [LICENSE](LICENSE) for details.
