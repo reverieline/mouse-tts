@@ -25,7 +25,7 @@ A lightweight Windows utility that copies and reads selected text aloud when you
 
 ### Option A — Standalone executable (no Python needed)
 
-1. Download `mouse_tts.exe` from Release.
+1. Download `mouse_tts.exe` from the [latest release](https://github.com/reverieline/mouse-tts/releases/latest).
 2. Run it — no installation required.
 
 ### Option B — Run from source
