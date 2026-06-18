@@ -9,11 +9,13 @@ from __future__ import annotations
 import configparser
 import ctypes
 import html
+import logging
 import re
 import sys
 import threading
 import time
 import winreg
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from ctypes import wintypes
@@ -28,6 +30,7 @@ from pynput import keyboard, mouse
 # ── constants ────────────────────────────────────────────────────────────────
 
 CONFIG_FILENAME = "config.ini"
+LOG_FILENAME = "mouse_tts.log"
 AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 AUTOSTART_APP_NAME = "MouseTTS"
 XMLNS_SPEECH = "http://www.w3.org/2001/10/synthesis"
@@ -43,6 +46,9 @@ DEFAULT_EXCLUDE_PATTERN_STRINGS: tuple[str, ...] = (
     r"\[.*\]",
     r"(?:https?://|www\.)\S+",
 )
+
+LOGGER = logging.getLogger("mouse_tts")
+LOGGING_CONFIGURED = False
 
 ERROR_ALREADY_EXISTS = 183
 SINGLE_INSTANCE_MUTEX = "MouseTTS_SingleInstance"
@@ -195,6 +201,7 @@ class SpeechController:
             try:
                 speaker.Speak(xml, SVSF_ASYNC | SVSF_IS_XML)
             except Exception:
+                LOGGER.exception("SAPI XML speak failed; retrying without XML")
                 speaker.Speak(sanitized, SVSF_ASYNC)
 
             while True:
@@ -202,12 +209,13 @@ class SpeechController:
                     try:
                         speaker.Speak("", SVSF_ASYNC | SVSF_PURGE_BEFORE_SPEAK)
                     except Exception:
-                        pass
+                        LOGGER.exception("Failed to purge SAPI speech")
                     return False
                 try:
                     if speaker.WaitUntilDone(10):
                         return True
                 except Exception:
+                    LOGGER.exception("SAPI WaitUntilDone failed")
                     return False
         finally:
             with self._lock:
@@ -297,7 +305,7 @@ class MouseTriggerHook:
                     gen = self.speech.begin_trigger()
                     self.clipboard.begin_trigger(gen)
                     threading.Thread(
-                        target=_trigger_worker,
+                        target=_trigger_worker_entry,
                         args=(self.settings, self.speech, self.clipboard, gen),
                         daemon=True,
                     ).start()
@@ -321,6 +329,7 @@ class App:
         try:
             self._voices: list[dict] = _list_voices()
         except Exception:
+            LOGGER.exception("Failed to list SAPI voices")
             self._voices = []
 
         self.root = tk.Tk()
@@ -335,7 +344,7 @@ class App:
             if self.config_path.exists():
                 initial = read_settings(self.config_path)
         except Exception:
-            pass
+            LOGGER.exception("Failed to read settings from %s", self.config_path)
         self._populate(initial)
 
         if initial is not None:
@@ -644,7 +653,7 @@ class App:
         try:
             self._tray.stop()
         except Exception:
-            pass
+            LOGGER.exception("Failed to stop tray icon")
         self.root.destroy()
 
     def _set_status(self, text: str) -> None:
@@ -675,6 +684,59 @@ def _resource_path(name: str) -> Path:
     return Path(__file__).parent / name
 
 
+def _work_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path.cwd()
+
+
+def _log_path() -> Path:
+    return _work_dir() / LOG_FILENAME
+
+
+def _configure_logging() -> None:
+    global LOGGING_CONFIGURED
+    if LOGGING_CONFIGURED:
+        return
+    log_path = _log_path()
+    handler = logging.FileHandler(log_path, encoding="utf-8")
+    handler.setFormatter(
+        logging.Formatter("%(asctime)s %(levelname)s [%(threadName)s] %(name)s: %(message)s")
+    )
+    root = logging.getLogger()
+    root.handlers.clear()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    root.addHandler(logging.StreamHandler(sys.stderr))
+    LOGGING_CONFIGURED = True
+    _install_exception_hooks()
+    LOGGER.info("Logging to %s", log_path)
+
+
+def _install_exception_hooks() -> None:
+    def _sys_excepthook(exc_type, exc_value, exc_traceback) -> None:
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_traceback)
+            return
+        LOGGER.critical(
+            "Unhandled exception",
+            exc_info=(exc_type, exc_value, exc_traceback),
+        )
+
+    def _thread_excepthook(args) -> None:
+        if issubclass(args.exc_type, KeyboardInterrupt):
+            return
+        LOGGER.critical(
+            "Unhandled exception in thread %s",
+            args.thread.name if args.thread is not None else "<unknown>",
+            exc_info=(args.exc_type, args.exc_value, args.exc_traceback),
+        )
+
+    sys.excepthook = _sys_excepthook
+    if hasattr(threading, "excepthook"):
+        threading.excepthook = _thread_excepthook  # type: ignore[assignment]
+
+
 def _config_path() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent / CONFIG_FILENAME
@@ -685,14 +747,27 @@ def _tray_icon() -> Image.Image:
     return Image.open(_resource_path("icon.ico"))
 
 
+@contextmanager
+def _com_initialized():
+    import pythoncom
+
+    pythoncom.CoInitialize()
+    try:
+        yield
+    finally:
+        pythoncom.CoUninitialize()
+
+
 def _list_voices() -> list[dict]:
-    import win32com.client
-    spv = win32com.client.Dispatch("SAPI.SpVoice")
-    voices = spv.GetVoices()
-    return [
-        {"id": str(voices.Item(i).Id), "name": str(voices.Item(i).GetDescription())}
-        for i in range(voices.Count)
-    ]
+    with _com_initialized():
+        import win32com.client
+
+        spv = win32com.client.Dispatch("SAPI.SpVoice")
+        voices = spv.GetVoices()
+        return [
+            {"id": str(voices.Item(i).Id), "name": str(voices.Item(i).GetDescription())}
+            for i in range(voices.Count)
+        ]
 
 
 def find_voice_token(speaker, settings: Settings):
@@ -723,9 +798,20 @@ def _trigger_worker(
         if text:
             speech.speak(settings, text, generation)
     except Exception:
-        pass
+        LOGGER.exception("Trigger worker failed")
+        raise
     finally:
         clipboard.finish_trigger(generation)
+
+
+def _trigger_worker_entry(
+    settings: Settings,
+    speech: SpeechController,
+    clipboard: ClipboardSession,
+    generation: int,
+) -> None:
+    with _com_initialized():
+        _trigger_worker(settings, speech, clipboard, generation)
 
 
 def _copy_selected(timeout: float = 1.5) -> str:
@@ -757,6 +843,7 @@ def safe_paste() -> str:
     try:
         return pyperclip.paste()
     except pyperclip.PyperclipException:
+        LOGGER.exception("Clipboard paste failed")
         return ""
 
 
@@ -764,7 +851,7 @@ def safe_copy(text: str) -> None:
     try:
         pyperclip.copy(text)
     except pyperclip.PyperclipException:
-        pass
+        LOGGER.exception("Clipboard copy failed")
 
 
 def _btn_for_msg(message: int, mouse_data: int) -> mouse.Button | None:
@@ -808,6 +895,7 @@ def _get_autostart() -> bool:
         winreg.CloseKey(key)
         return True
     except OSError:
+        LOGGER.exception("Failed to read autostart registry state")
         return False
 
 
@@ -823,11 +911,11 @@ def _fix_autostart_path() -> None:
             if stored_path != sys.executable:
                 winreg.SetValueEx(key, AUTOSTART_APP_NAME, 0, winreg.REG_SZ, f'"{sys.executable}"')
         except OSError:
-            pass
+            LOGGER.exception("Failed to repair autostart registry value")
         finally:
             winreg.CloseKey(key)
     except OSError:
-        pass
+        LOGGER.exception("Failed to open autostart registry key")
 
 
 def _set_autostart(enable: bool) -> None:
@@ -839,7 +927,7 @@ def _set_autostart(enable: bool) -> None:
             try:
                 winreg.DeleteValue(key, AUTOSTART_APP_NAME)
             except OSError:
-                pass
+                LOGGER.exception("Failed to remove autostart registry value")
     finally:
         winreg.CloseKey(key)
 
@@ -955,6 +1043,7 @@ def main() -> int:
     _mutex = kernel32.CreateMutexW(None, True, SINGLE_INSTANCE_MUTEX)
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         return 0
+    _configure_logging()
     if getattr(sys, "frozen", False):
         _fix_autostart_path()
     App().run()

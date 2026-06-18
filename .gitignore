@@ -2,3 +2,4 @@ build/
 dist/
 *.spec.bak
 __pycache__/
+.go.ps1

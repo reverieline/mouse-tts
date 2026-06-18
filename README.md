@@ -57,6 +57,10 @@ The compiled binary will be at `dist\mouse_tts.exe`.
 6. Select text anywhere and press your trigger button to hear it read aloud.
 7. Minimize the window to minimize to the system tray. Right-click the tray icon to open settings or quit.
 
+Logs are written to `mouse_tts.log` in the application work directory:
+- When running from source, that is the directory you launched `python mouse_tts.py` from.
+- When running the packaged `.exe`, that is the folder containing `mouse_tts.exe`.
+
 ## Safety notes
 
 - **Left / right button suppression without a modifier is blocked** — suppressing those without a modifier would make your primary buttons unusable.
